@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.27"
 egui = "0.27"
+eframe = { version = "0.27", features = ["default_fonts"] }
 enigo = "0.1"
 rdev = "0.5"
 serde = { version = "1", features = ["derive"] }

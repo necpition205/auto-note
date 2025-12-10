@@ -1,445 +1,338 @@
-mod recorder;
-
-use eframe::{egui, NativeOptions};
-use enigo::Key;
-use rdev::Key as RdevKey;
-use recorder::MacroRecorder;
-use std::{
-  collections::{BTreeMap, HashMap},
-  sync::{Arc, Mutex},
+use eframe::egui;
+use rdev::{listen, Event, EventType, Key};
+use std::sync::{
+  atomic::{AtomicBool, Ordering},
+  Arc, Mutex,
 };
+use std::thread;
+use std::time::{Duration, Instant};
 
-struct OverlayApp {
-  recorder: Arc<Mutex<MacroRecorder>>,
-  allowed_input: String,
-  last_parse_error: Option<String>,
-  hotkey_toggle_input: String,
-  hotkey_playback_input: String,
-  rain_anchor_ms: f64,
-  save_path: String,
-  rain_speed: f32,
-}
-
-impl OverlayApp {
-  fn new() -> Self {
-    let recorder = Arc::new(Mutex::new(MacroRecorder::default()));
-    if let Ok(mut guard) = recorder.lock() {
-      guard.start_listener();
-      let _ = guard.load_from_disk(std::path::Path::new("samples.json"));
-    }
-    Self {
-      recorder,
-      allowed_input: String::from("a,s,d,f,j,k,l,space"),
-      last_parse_error: None,
-      hotkey_toggle_input: String::from("F9"),
-      hotkey_playback_input: String::from("F10"),
-      rain_anchor_ms: 0.0,
-      save_path: String::from("samples.json"),
-      rain_speed: 1.2,
-    }
-  }
-}
-
-fn parse_key_token(token: &str) -> Result<Key, String> {
-  let t = token.trim().to_lowercase();
-  if t.is_empty() {
-    return Err("empty token".into());
-  }
-  if t.len() == 1 {
-    let ch = t.chars().next().unwrap();
-    return Ok(Key::Layout(ch));
-  }
-  let key = match t.as_str() {
-    "space" => Key::Space,
-    "enter" | "return" => Key::Return,
-    "tab" => Key::Tab,
-    "esc" | "escape" => Key::Escape,
-    "up" => Key::UpArrow,
-    "down" => Key::DownArrow,
-    "left" => Key::LeftArrow,
-    "right" => Key::RightArrow,
-    "shift" => Key::Shift,
-    "ctrl" | "control" => Key::Control,
-    "alt" => Key::Alt,
-    "meta" | "win" | "cmd" => Key::Meta,
-    other => return Err(format!("unsupported key: {other}")),
-  };
-  Ok(key)
-}
-
-fn parse_allowed(input: &str) -> Result<Vec<Key>, String> {
-  let mut keys = Vec::new();
-  for tok in input.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-    keys.push(parse_key_token(tok)?);
-  }
-  if keys.is_empty() {
-    return Err("no keys provided".into());
-  }
-  Ok(keys)
-}
-
-fn parse_rdev_key(input: &str) -> Option<RdevKey> {
-  match input.trim().to_uppercase().as_str() {
-    "F1" => Some(RdevKey::F1),
-    "F2" => Some(RdevKey::F2),
-    "F3" => Some(RdevKey::F3),
-    "F4" => Some(RdevKey::F4),
-    "F5" => Some(RdevKey::F5),
-    "F6" => Some(RdevKey::F6),
-    "F7" => Some(RdevKey::F7),
-    "F8" => Some(RdevKey::F8),
-    "F9" => Some(RdevKey::F9),
-    "F10" => Some(RdevKey::F10),
-    "F11" => Some(RdevKey::F11),
-    "F12" => Some(RdevKey::F12),
-    "SPACE" => Some(RdevKey::Space),
-    other => {
-      if other.len() == 1 {
-        match other.chars().next().unwrap() {
-          'A' => Some(RdevKey::KeyA),
-          'B' => Some(RdevKey::KeyB),
-          'C' => Some(RdevKey::KeyC),
-          'D' => Some(RdevKey::KeyD),
-          'E' => Some(RdevKey::KeyE),
-          'F' => Some(RdevKey::KeyF),
-          'G' => Some(RdevKey::KeyG),
-          'H' => Some(RdevKey::KeyH),
-          'I' => Some(RdevKey::KeyI),
-          'J' => Some(RdevKey::KeyJ),
-          'K' => Some(RdevKey::KeyK),
-          'L' => Some(RdevKey::KeyL),
-          'M' => Some(RdevKey::KeyM),
-          'N' => Some(RdevKey::KeyN),
-          'O' => Some(RdevKey::KeyO),
-          'P' => Some(RdevKey::KeyP),
-          'Q' => Some(RdevKey::KeyQ),
-          'R' => Some(RdevKey::KeyR),
-          'S' => Some(RdevKey::KeyS),
-          'T' => Some(RdevKey::KeyT),
-          'U' => Some(RdevKey::KeyU),
-          'V' => Some(RdevKey::KeyV),
-          'W' => Some(RdevKey::KeyW),
-          'X' => Some(RdevKey::KeyX),
-          'Y' => Some(RdevKey::KeyY),
-          'Z' => Some(RdevKey::KeyZ),
-          _ => None,
-        }
-      } else {
-        None
-      }
-    }
-  }
-}
-
-impl eframe::App for OverlayApp {
-  fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-    let now_ms = ctx.input(|i| i.time) * 1000.0;
-    if self.rain_anchor_ms <= 0.0 {
-      self.rain_anchor_ms = now_ms;
-    }
-    if let Ok(mut rec) = self.recorder.lock() {
-      rec.poll_events();
-    }
-
-    egui::TopBottomPanel::top("controls").show(ctx, |ui| {
-      ui.heading("Macro Overlay");
-      ui.label("Record global key input and play it back.");
-    });
-
-    egui::CentralPanel::default().show(ctx, |ui| {
-      if let Ok(mut rec) = self.recorder.lock() {
-        let timing_avg = rec.timing_map();
-        ui.group(|ui| {
-          ui.label("Allowed keys (comma separated, e.g., a,s,d,f,j,k,l,space)");
-          let edit = ui.text_edit_singleline(&mut self.allowed_input);
-          if edit.lost_focus() {
-            self.last_parse_error = None;
-          }
-          if ui.button("Apply").clicked() {
-            match parse_allowed(&self.allowed_input) {
-              Ok(list) => {
-                rec.set_allowed_keys(list);
-                self.last_parse_error = None;
-              }
-              Err(err) => {
-                self.last_parse_error = Some(err);
-              }
-            }
-          }
-          if let Some(err) = &self.last_parse_error {
-            ui.colored_label(egui::Color32::RED, err);
-          }
-          ui.label("Current allowed:");
-          let allowed = rec.allowed_keys_snapshot();
-          ui.horizontal_wrapped(|ui| {
-            for k in allowed {
-              ui.label(format!("{k:?}"));
-            }
-          });
-        });
-
-        ui.horizontal(|ui| {
-          if ui
-            .button(if rec.is_recording {
-              "Stop Recording"
-            } else {
-              "Start Recording"
-            })
-            .clicked()
-          {
-            if rec.is_recording {
-              rec.finish_recording();
-            } else {
-              rec.start_recording();
-              self.rain_anchor_ms = now_ms;
-            }
-          }
-          if ui.button("Clear").clicked() {
-            rec.clear();
-            self.rain_anchor_ms = now_ms;
-          }
-          if ui.button("Play Back (avg)").clicked() {
-            if !timing_avg.is_empty() {
-              rec.play_timing_map(timing_avg.clone());
-            }
-          }
-          ui.label("Save path:");
-          ui.text_edit_singleline(&mut self.save_path);
-          if ui.button("Save samples").clicked() {
-            let _ = rec.save_to_disk(std::path::Path::new(&self.save_path));
-          }
-          if ui.button("Load samples").clicked() {
-            let _ = rec.load_from_disk(std::path::Path::new(&self.save_path));
-          }
-        });
-
-        ui.separator();
-        ui.label(format!("Live events: {}", rec.live_events.len()));
-        ui.label(format!("Samples stored: {}", rec.samples.len()));
-        if rec.is_recording {
-            ui.colored_label(egui::Color32::LIGHT_GREEN, "Recording...");
-        } else if !rec.samples.is_empty() {
-            ui.colored_label(egui::Color32::LIGHT_BLUE, "Samples ready.");
-        }
-
-        ui.separator();
-        ui.label("Key viewer (currently pressed):");
-        let pressed = rec.pressed_keys_snapshot();
-        egui::Frame::none()
-          .fill(egui::Color32::TRANSPARENT)
-          .show(ui, |ui| {
-            if pressed.is_empty() {
-              ui.label("None");
-            } else {
-              ui.horizontal_wrapped(|ui| {
-                for k in pressed {
-                  ui.colored_label(egui::Color32::LIGHT_YELLOW, format!("{k:?}"));
-                }
-              });
-            }
-          });
-
-        ui.separator();
-        ui.label("Hotkeys (press Enter to apply):");
-        let toggle_resp = ui.text_edit_singleline(&mut self.hotkey_toggle_input);
-        let playback_resp = ui.text_edit_singleline(&mut self.hotkey_playback_input);
-        let apply_hotkey = toggle_resp.lost_focus() || playback_resp.lost_focus();
-        if apply_hotkey {
-          if let (Some(t), Some(p)) = (
-            parse_rdev_key(&self.hotkey_toggle_input),
-            parse_rdev_key(&self.hotkey_playback_input),
-          ) {
-            rec.set_hotkeys(t, p);
-          }
-        }
-
-        ui.horizontal(|ui| {
-          ui.label("Outlier k:");
-          let mut k = rec.outlier_k;
-          if ui.add(egui::DragValue::new(&mut k).clamp_range(0.5..=5.0)).changed() {
-            rec.outlier_k = k;
-          }
-          ui.checkbox(&mut rec.use_median, "Use median instead of mean");
-        });
-
-        ui.horizontal(|ui| {
-          ui.label("Playback offset (ms):");
-          ui.add(egui::Slider::new(&mut rec.playback_offset_ms, -50..=50));
-        });
-
-        ui.horizontal(|ui| {
-          ui.label("Rain speed:");
-          ui.add(egui::Slider::new(&mut self.rain_speed, 0.5..=3.0).show_value(true));
-          if ui.button("Reset rain").clicked() {
-            self.rain_anchor_ms = now_ms;
-          }
-        });
-
-        ui.horizontal(|ui| {
-          ui.checkbox(&mut rec.autosave, "Autosave samples");
-          ui.label("Per-key offset (ms) for allowed keys:");
-        });
-        egui::ScrollArea::horizontal()
-          .max_height(80.0)
-          .show(ui, |ui| {
-            for key in rec.allowed_keys_snapshot() {
-              let mut entry = rec
-                .key_offsets_snapshot()
-                .into_iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, v)| v)
-                .unwrap_or(0);
-              ui.vertical(|ui| {
-                ui.label(format!("{key:?}"));
-                if ui
-                  .add(egui::Slider::new(&mut entry, -30..=30).show_value(true))
-                  .changed()
-                {
-                  rec.set_key_offset(key, entry);
-                }
-              });
-              ui.add_space(6.0);
-            }
-          });
-
-        ui.separator();
-        ui.label("Samples:");
-        egui::ScrollArea::vertical()
-          .max_height(140.0)
-          .show(ui, |ui| {
-            for sample in rec.samples_snapshot() {
-              let mut key_count: HashMap<String, usize> = HashMap::new();
-              for e in &sample.events {
-                *key_count.entry(format!("{:?}", e.key)).or_default() += 1;
-              }
-              let length_ms = sample.events.iter().map(|e| e.delta_ms).max().unwrap_or(0);
-              ui.horizontal(|ui| {
-                ui.label(format!("ID {}", sample.id));
-                let mut name = sample.name.clone();
-                if ui.text_edit_singleline(&mut name).lost_focus() && name != sample.name {
-                  rec.rename_sample(sample.id, name);
-                }
-                ui.label(format!("events {} | len {} ms", sample.events.len(), length_ms));
-                if !key_count.is_empty() {
-                  ui.label(format!(
-                    " keys: {}",
-                    key_count.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(", ")
-                  ));
-                }
-                if ui.button("Play").clicked() {
-                  rec.play_sample(sample.id);
-                }
-                if ui.button("Delete").clicked() {
-                  rec.delete_sample(sample.id);
-                }
-              });
-            }
-          });
-
-        egui::ScrollArea::vertical()
-          .max_height(200.0)
-          .show(ui, |ui| {
-            for (idx, evt) in rec.live_events.iter().enumerate() {
-              let label = format!("{idx}: {:?} {:?} {}ms", evt.mode, evt.key, evt.delta_ms);
-              ui.monospace(label);
-            }
-          });
-
-        if !rec.samples.is_empty() {
-          ui.separator();
-          ui.label("Aggregated timing (avg):");
-          for (idx, evt) in timing_avg.iter().enumerate() {
-            ui.monospace(format!("{idx}: {:?} {:?} {}ms", evt.mode, evt.key, evt.delta_ms));
-          }
-
-          // Ghost rain preview (static): show bars per key with relative timing.
-          if !timing_avg.is_empty() {
-            ui.separator();
-            ui.label("Rain / Ghost preview:");
-            // lanes: key -> (current live presses, ghost presses from last sample)
-            let lane_width = 60.0;
-            let lane_height = 160.0;
-            let mut lanes: BTreeMap<String, (Vec<u128>, Vec<u128>)> = BTreeMap::new();
-            for evt in rec.live_events.iter().filter(|e| e.mode == recorder::RecordedMode::Press) {
-              lanes.entry(format!("{:?}", evt.key)).or_default().0.push(evt.delta_ms);
-            }
-            if let Some(last_sample) = rec.samples_snapshot().last() {
-              for evt in last_sample
-                .events
-                .iter()
-                .filter(|e| e.mode == recorder::RecordedMode::Press)
-              {
-                lanes
-                  .entry(format!("{:?}", evt.key))
-                  .or_default()
-                  .1
-                  .push(evt.delta_ms);
-              }
-            }
-            let max_ms = lanes
-              .values()
-              .flat_map(|(live, ghost)| live.iter().chain(ghost.iter()))
-              .copied()
-              .max()
-              .unwrap_or(1);
-            let fall_speed = self.rain_speed.max(0.1); // higher is faster
-
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-              for (key_label, (live, ghost)) in lanes {
-                ui.vertical(|ui| {
-                  ui.label(&key_label);
-                  let (rect, _resp) = ui.allocate_exact_size(egui::vec2(lane_width, lane_height), egui::Sense::hover());
-                  let painter = ui.painter_at(rect);
-                  let live_color = egui::Color32::from_rgba_unmultiplied(120, 200, 255, 180);
-                  let ghost_color = egui::Color32::from_rgba_unmultiplied(200, 120, 255, 100);
-                  for t in ghost {
-                    let anim = (t as f32) - ((now_ms - self.rain_anchor_ms) as f32 * fall_speed);
-                    if anim < 0.0 {
-                      continue;
-                    }
-                    let y = rect.bottom() - (anim / max_ms as f32 * lane_height);
-                    let bar = egui::Rect::from_min_max(
-                      egui::pos2(rect.left(), y - 3.0),
-                      egui::pos2(rect.right(), y + 3.0),
-                    );
-                    painter.rect_filled(bar, 2.0, ghost_color);
-                  }
-                  for t in live {
-                    let anim = (t as f32) - ((now_ms - self.rain_anchor_ms) as f32 * fall_speed);
-                    if anim < 0.0 {
-                      continue;
-                    }
-                    let y = rect.bottom() - (anim / max_ms as f32 * lane_height);
-                    let bar = egui::Rect::from_min_max(
-                      egui::pos2(rect.left(), y - 4.0),
-                      egui::pos2(rect.right(), y + 4.0),
-                    );
-                    painter.rect_filled(bar, 3.0, live_color);
-                  }
-                });
-                ui.add_space(8.0);
-              }
-            });
-          }
-        }
-      }
-    });
-  }
-}
+mod macro_play;
+mod schema;
 
 fn main() -> eframe::Result<()> {
-  let native_options = NativeOptions {
+  let state = AppState::new();
+  state.spawn_global_listener();
+
+  let options = eframe::NativeOptions {
     viewport: egui::ViewportBuilder::default()
-      .with_always_on_top()
-      .with_decorations(true)
-      .with_transparent(true)
-      .with_inner_size([420.0, 360.0]),
+      .with_inner_size([360.0, 240.0])
+      .with_always_on_top(),
     ..Default::default()
   };
 
   eframe::run_native(
-    "Auto Note Macro Overlay",
-    native_options,
-    Box::new(|_| Box::new(OverlayApp::new())),
+    "Auto Note Recorder",
+    options,
+    Box::new(move |_cc| Box::new(RecorderApp { state: state.clone() })),
   )
+}
+
+#[derive(Clone)]
+struct AppState {
+  recording: Arc<AtomicBool>,
+  start: Arc<Mutex<Option<Instant>>>,
+  current_events: Arc<Mutex<Vec<schema::TimedEvent>>>,
+  samples: Arc<Mutex<Vec<Vec<schema::TimedEvent>>>>,
+  playback_stop: Arc<AtomicBool>,
+  playback_handle: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+  playback_offset_ms: Arc<Mutex<i64>>,
+  playing: Arc<AtomicBool>,
+}
+
+impl AppState {
+  fn new() -> Self {
+    Self {
+      recording: Arc::new(AtomicBool::new(false)),
+      start: Arc::new(Mutex::new(None)),
+      current_events: Arc::new(Mutex::new(Vec::new())),
+      samples: Arc::new(Mutex::new(Vec::new())),
+      playback_stop: Arc::new(AtomicBool::new(false)),
+      playback_handle: Arc::new(Mutex::new(None)),
+      playback_offset_ms: Arc::new(Mutex::new(0)),
+      playing: Arc::new(AtomicBool::new(false)),
+    }
+  }
+
+  fn spawn_global_listener(&self) {
+    let state = self.clone();
+    thread::spawn(move || {
+      if let Err(error) = listen(move |event| handle_event(&state, event)) {
+        eprintln!("Listener error: {:?}", error);
+      }
+    });
+  }
+
+  fn start_recording(&self) {
+    self.current_events.lock().unwrap().clear();
+    *self.start.lock().unwrap() = Some(Instant::now());
+    self.recording.store(true, Ordering::SeqCst);
+  }
+
+  fn stop_recording(&self) {
+    let was_recording = self.recording.swap(false, Ordering::SeqCst);
+    if !was_recording {
+      return;
+    }
+    let snapshot = self.current_events.lock().unwrap().clone();
+    if !snapshot.is_empty() {
+      self.samples.lock().unwrap().push(snapshot);
+    }
+  }
+
+  fn playback_latest(&self) {
+    let samples = self.samples.lock().unwrap();
+    if let Some(last) = samples.last() {
+      self.playback_sample(last.clone());
+    } else {
+      println!("No samples to play.");
+    }
+  }
+
+  fn playback_sample(&self, sample: Vec<schema::TimedEvent>) {
+    log_recorded_events(&sample);
+    if sample.is_empty() {
+      println!("No events recorded; nothing to play back.");
+      return;
+    }
+    println!("Focus the target window within 500ms...");
+    self.stop_playback(); // stop any ongoing playback before starting new
+    self.playback_stop.store(false, Ordering::SeqCst);
+    self.playing.store(true, Ordering::SeqCst);
+    let offset_ms = *self.playback_offset_ms.lock().unwrap();
+    let max_at = sample
+      .iter()
+      .map(|e| apply_offset(e.at, offset_ms))
+      .max()
+      .unwrap_or(Duration::from_millis(0));
+    let stop_flag = self.playback_stop.clone();
+    let handle = macro_play::play_timeline_async(sample, stop_flag, offset_ms);
+    *self.playback_handle.lock().unwrap() = Some(handle);
+    // Schedule a watcher thread to auto-clear the handle after expected duration.
+    let handle_ref = self.playback_handle.clone();
+    let playing_flag = self.playing.clone();
+    thread::spawn(move || {
+      thread::sleep(max_at + Duration::from_millis(300));
+      if let Some(joined) = handle_ref.lock().unwrap().take() {
+        let _ = joined.join();
+      }
+      playing_flag.store(false, Ordering::SeqCst);
+    });
+  }
+
+  fn delete_sample(&self, idx: usize) {
+    let mut samples = self.samples.lock().unwrap();
+    if idx < samples.len() {
+      samples.remove(idx);
+    }
+  }
+
+  fn stop_playback(&self) {
+    self.playback_stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = self.playback_handle.lock().unwrap().take() {
+      let _ = handle.join();
+    }
+    self.playing.store(false, Ordering::SeqCst);
+  }
+}
+
+struct RecorderApp {
+  state: AppState,
+}
+
+impl eframe::App for RecorderApp {
+  fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // Keep UI refreshing so counters update even without mouse movement.
+    ctx.request_repaint_after(Duration::from_millis(16));
+    egui::CentralPanel::default().show(ctx, |ui| {
+      ui.heading("Auto Note Recorder");
+      ui.separator();
+
+      let is_rec = self.state.recording.load(Ordering::SeqCst);
+      ui.horizontal_wrapped(|ui| {
+        if ui.add_enabled(!is_rec, egui::Button::new("Start Recording")).clicked() {
+          self.state.start_recording();
+        }
+        if ui.add_enabled(is_rec, egui::Button::new("Stop Recording")).clicked() {
+          self.state.stop_recording();
+        }
+        if ui.button("Playback Latest").clicked() {
+          self.state.stop_recording();
+          self.state.playback_latest();
+        }
+        if ui.button("Stop Playback").clicked() {
+          self.state.stop_playback();
+        }
+      });
+
+      ui.separator();
+      ui.horizontal_wrapped(|ui| {
+        ui.label("Playback offset (ms):");
+        let mut offset_ms = *self.state.playback_offset_ms.lock().unwrap();
+        if ui.add(egui::DragValue::new(&mut offset_ms).speed(1)).changed() {
+          *self.state.playback_offset_ms.lock().unwrap() = offset_ms;
+        }
+      });
+      ui.separator();
+      let ev_len = self.state.current_events.lock().unwrap().len();
+      ui.label(format!("Recording: {}", if is_rec { "ON" } else { "OFF" }));
+      let is_playing = self.state.playing.load(Ordering::SeqCst);
+      ui.label(format!("Playing: {}", if is_playing { "ON" } else { "OFF" }));
+      ui.label(format!("Events captured (current): {}", ev_len));
+
+      ui.separator();
+      ui.heading("Recorded Samples");
+      let mut to_delete: Option<usize> = None;
+      let samples = self.state.samples.lock().unwrap().clone();
+      for (idx, sample) in samples.iter().enumerate() {
+        ui.horizontal(|ui| {
+          ui.label(format!("#{}: {} events", idx + 1, sample.len()));
+          if ui.button("Play").clicked() {
+            self.state.playback_sample(sample.clone());
+          }
+          if ui.button("Delete").clicked() {
+            to_delete = Some(idx);
+          }
+        });
+      }
+      drop(samples);
+      if let Some(idx) = to_delete {
+        self.state.delete_sample(idx);
+      }
+    });
+  }
+}
+
+fn handle_event(state: &AppState, event: Event) {
+  // Hotkeys: F9 toggle record, F10 toggle playback.
+  if let EventType::KeyPress(key) = event.event_type {
+    match key {
+      Key::F9 => {
+        if state.recording.load(Ordering::SeqCst) {
+          state.stop_recording();
+          println!("Recording stopped via F9");
+        } else {
+          state.start_recording();
+          println!("Recording started via F9");
+        }
+        return;
+      }
+      Key::F10 => {
+        if state.playing.load(Ordering::SeqCst) {
+          state.stop_playback();
+          println!("Playback stopped via F10");
+        } else {
+          state.stop_recording();
+          state.playback_latest();
+          println!("Playback started via F10");
+        }
+        return;
+      }
+      _ => {}
+    }
+  }
+
+  if !state.recording.load(Ordering::SeqCst) {
+    return;
+  }
+
+  let Some(start_at) = *state.start.lock().unwrap() else {
+    return;
+  };
+
+  match event.event_type {
+    EventType::KeyPress(key) => {
+      if let Some(mapped) = convert_key(key) {
+        push_event(schema::KeyAction::Down(mapped), start_at, &state.current_events);
+      } else {
+        println!("record: unmapped keypress {:?}", key);
+      }
+    }
+    EventType::KeyRelease(key) => {
+      if let Some(mapped) = convert_key(key) {
+        push_event(schema::KeyAction::Up(mapped), start_at, &state.current_events);
+      } else {
+        println!("record: unmapped keyrelease {:?}", key);
+      }
+    }
+    _ => {}
+  }
+}
+
+fn push_event(action: schema::KeyAction, start: Instant, sink: &Arc<Mutex<Vec<schema::TimedEvent>>>) {
+  let elapsed = Instant::now().duration_since(start);
+  sink.lock()
+      .unwrap()
+      .push(schema::TimedEvent { at: elapsed, action });
+}
+
+fn log_recorded_events(events: &[schema::TimedEvent]) {
+  println!("Recorded {} events:", events.len());
+  for (i, ev) in events.iter().enumerate() {
+    println!("  #{:<3} at {:>6} ms => {:?}", i, ev.at.as_millis(), ev.action);
+  }
+}
+
+fn apply_offset(at: Duration, offset_ms: i64) -> Duration {
+  if offset_ms >= 0 {
+    at + Duration::from_millis(offset_ms as u64)
+  } else {
+    at.saturating_sub(Duration::from_millis(offset_ms.unsigned_abs()))
+  }
+}
+
+fn convert_key(key: Key) -> Option<enigo::Key> {
+  // rdev Key -> enigo Key mapping. Return None if unknown to avoid sending spaces.
+  let mapped = match key {
+    Key::KeyA => enigo::Key::Layout('a'),
+    Key::KeyB => enigo::Key::Layout('b'),
+    Key::KeyC => enigo::Key::Layout('c'),
+    Key::KeyD => enigo::Key::Layout('d'),
+    Key::KeyE => enigo::Key::Layout('e'),
+    Key::KeyF => enigo::Key::Layout('f'),
+    Key::KeyG => enigo::Key::Layout('g'),
+    Key::KeyH => enigo::Key::Layout('h'),
+    Key::KeyI => enigo::Key::Layout('i'),
+    Key::KeyJ => enigo::Key::Layout('j'),
+    Key::KeyK => enigo::Key::Layout('k'),
+    Key::KeyL => enigo::Key::Layout('l'),
+    Key::KeyM => enigo::Key::Layout('m'),
+    Key::KeyN => enigo::Key::Layout('n'),
+    Key::KeyO => enigo::Key::Layout('o'),
+    Key::KeyP => enigo::Key::Layout('p'),
+    Key::KeyQ => enigo::Key::Layout('q'),
+    Key::KeyR => enigo::Key::Layout('r'),
+    Key::KeyS => enigo::Key::Layout('s'),
+    Key::KeyT => enigo::Key::Layout('t'),
+    Key::KeyU => enigo::Key::Layout('u'),
+    Key::KeyV => enigo::Key::Layout('v'),
+    Key::KeyW => enigo::Key::Layout('w'),
+    Key::KeyX => enigo::Key::Layout('x'),
+    Key::KeyY => enigo::Key::Layout('y'),
+    Key::KeyZ => enigo::Key::Layout('z'),
+    Key::Num0 => enigo::Key::Layout('0'),
+    Key::Num1 => enigo::Key::Layout('1'),
+    Key::Num2 => enigo::Key::Layout('2'),
+    Key::Num3 => enigo::Key::Layout('3'),
+    Key::Num4 => enigo::Key::Layout('4'),
+    Key::Num5 => enigo::Key::Layout('5'),
+    Key::Num6 => enigo::Key::Layout('6'),
+    Key::Num7 => enigo::Key::Layout('7'),
+    Key::Num8 => enigo::Key::Layout('8'),
+    Key::Num9 => enigo::Key::Layout('9'),
+    Key::Space => enigo::Key::Space,
+    Key::Return => enigo::Key::Return,
+    Key::Backspace => enigo::Key::Backspace,
+    Key::Tab => enigo::Key::Tab,
+    Key::Escape => enigo::Key::Escape,
+    Key::UpArrow => enigo::Key::UpArrow,
+    Key::DownArrow => enigo::Key::DownArrow,
+    Key::LeftArrow => enigo::Key::LeftArrow,
+    Key::RightArrow => enigo::Key::RightArrow,
+    Key::ShiftLeft | Key::ShiftRight => enigo::Key::Shift,
+    Key::ControlLeft | Key::ControlRight => enigo::Key::Control,
+    Key::Alt | Key::AltGr => enigo::Key::Alt,
+    _ => return None,
+  };
+  Some(mapped)
 }
